@@ -22,6 +22,7 @@ import sys
 from typing import Any
 from typing import Optional
 from typing import TextIO
+from typing import Union
 
 import anyio
 from pydantic import BaseModel
@@ -46,29 +47,61 @@ except ImportError as e:
 logger = logging.getLogger('google_adk.' + __name__)
 
 
-class SseServerParams(BaseModel):
+class StdioConnectionParams(BaseModel):
+  """Parameters for the MCP Stdio connection.
+
+  Attributes:
+      server_params: Parameters for the MCP Stdio server.
+      timeout: Timeout in seconds for establishing the connection to the MCP
+        stdio server.
+  """
+
+  server_params: StdioServerParameters
+  timeout: float = 5.0
+
+
+class SseConnectionParams(BaseModel):
   """Parameters for the MCP SSE connection.
 
   See MCP SSE Client documentation for more details.
   https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/client/sse.py
+
+  Attributes:
+      url: URL for the MCP SSE server.
+      headers: Headers for the MCP SSE connection.
+      timeout: Timeout in seconds for establishing the connection to the MCP SSE
+        server.
+      sse_read_timeout: Timeout in seconds for reading data from the MCP SSE
+        server.
   """
 
   url: str
   headers: dict[str, Any] | None = None
-  timeout: float = 5
-  sse_read_timeout: float = 60 * 5
+  timeout: float = 5.0
+  sse_read_timeout: float = 60 * 5.0
 
 
-class StreamableHTTPServerParams(BaseModel):
+class StreamableHTTPConnectionParams(BaseModel):
   """Parameters for the MCP SSE connection.
 
   See MCP SSE Client documentation for more details.
   https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/client/streamable_http.py
+
+  Attributes:
+      url: URL for the MCP Streamable HTTP server.
+      headers: Headers for the MCP Streamable HTTP connection.
+      timeout: Timeout in seconds for establishing the connection to the MCP
+        Streamable HTTP server.
+      sse_read_timeout: Timeout in seconds for reading data from the MCP
+        Streamable HTTP server.
+      terminate_on_close: Whether to terminate the MCP Streamable HTTP server
+        when the connection is closed.
   """
+
   url: str
   headers: dict[str, Any] | None = None
-  timeout: float = 5
-  sse_read_timeout: float = 60 * 5
+  timeout: float = 5.0
+  sse_read_timeout: float = 60 * 5.0
   terminate_on_close: bool = True
 
 
@@ -139,17 +172,37 @@ class MCPSessionManager:
 
   def __init__(
       self,
-      connection_params: StdioServerParameters | SseServerParams | StreamableHTTPServerParams,
+      connection_params: Union[
+          StdioServerParameters,
+          StdioConnectionParams,
+          SseConnectionParams,
+          StreamableHTTPConnectionParams,
+      ],
       errlog: TextIO = sys.stderr,
   ):
     """Initializes the MCP session manager.
 
     Args:
-        connection_params: Parameters for the MCP connection (Stdio, SSE or Streamable HTTP).
+        connection_params: Parameters for the MCP connection (Stdio, SSE or
+          Streamable HTTP). Stdio by default also has a 5s read timeout as other
+          parameters but it's not configurable for now.
         errlog: (Optional) TextIO stream for error logging. Use only for
           initializing a local stdio MCP session.
     """
-    self._connection_params = connection_params
+    if isinstance(connection_params, StdioServerParameters):
+      # So far timeout is not configurable. Given MCP is still evolving, we
+      # would expect stdio_client to evolve to accept timeout parameter like
+      # other client.
+      logger.warning(
+          'StdioServerParameters is not recommended. Please use'
+          ' StdioConnectionParams.'
+      )
+      self._connection_params = StdioConnectionParams(
+          server_params=connection_params,
+          timeout=5,
+      )
+    else:
+      self._connection_params = connection_params
     self._errlog = errlog
     # Each session manager maintains its own exit stack for proper cleanup
     self._exit_stack: Optional[AsyncExitStack] = None
@@ -168,23 +221,26 @@ class MCPSessionManager:
     self._exit_stack = AsyncExitStack()
 
     try:
-      if isinstance(self._connection_params, StdioServerParameters):
+      if isinstance(self._connection_params, StdioConnectionParams):
         client = stdio_client(
-            server=self._connection_params, errlog=self._errlog
+            server=self._connection_params.server_params,
+            errlog=self._errlog,
         )
-      elif isinstance(self._connection_params, SseServerParams):
+      elif isinstance(self._connection_params, SseConnectionParams):
         client = sse_client(
             url=self._connection_params.url,
             headers=self._connection_params.headers,
             timeout=self._connection_params.timeout,
             sse_read_timeout=self._connection_params.sse_read_timeout,
         )
-      elif isinstance(self._connection_params, StreamableHTTPServerParams):
+      elif isinstance(self._connection_params, StreamableHTTPConnectionParams):
         client = streamablehttp_client(
             url=self._connection_params.url,
             headers=self._connection_params.headers,
             timeout=timedelta(seconds=self._connection_params.timeout),
-            sse_read_timeout=timedelta(seconds=self._connection_params.sse_read_timeout),
+            sse_read_timeout=timedelta(
+                seconds=self._connection_params.sse_read_timeout
+            ),
             terminate_on_close=self._connection_params.terminate_on_close,
         )
       else:
@@ -197,9 +253,19 @@ class MCPSessionManager:
       transports = await self._exit_stack.enter_async_context(client)
       # The streamable http client returns a GetSessionCallback in addition to the read/write MemoryObjectStreams
       # needed to build the ClientSession, we limit then to the two first values to be compatible with all clients.
-      session = await self._exit_stack.enter_async_context(
-          ClientSession(*transports[:2])
-      )
+      if isinstance(self._connection_params, StdioConnectionParams):
+        session = await self._exit_stack.enter_async_context(
+            ClientSession(
+                *transports[:2],
+                read_timeout_seconds=timedelta(
+                    seconds=self._connection_params.timeout
+                ),
+            )
+        )
+      else:
+        session = await self._exit_stack.enter_async_context(
+            ClientSession(*transports[:2])
+        )
       await session.initialize()
 
       self._session = session
@@ -225,3 +291,8 @@ class MCPSessionManager:
       finally:
         self._exit_stack = None
         self._session = None
+
+
+SseServerParams = SseConnectionParams
+
+StreamableHTTPServerParams = StreamableHTTPConnectionParams

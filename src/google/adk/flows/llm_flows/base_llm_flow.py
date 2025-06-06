@@ -23,6 +23,7 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from google.genai import types
 from websockets.exceptions import ConnectionClosedOK
 
 from . import functions
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
   from ._base_llm_processor import BaseLlmResponseProcessor
 
 logger = logging.getLogger('google_adk.' + __name__)
+
+_ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 
 
 class BaseLlmFlow(ABC):
@@ -436,15 +439,29 @@ class BaseLlmFlow(ABC):
       function_response_event = await functions.handle_function_calls_live(
           invocation_context, model_response_event, llm_request.tools_dict
       )
-      yield function_response_event
 
       transfer_to_agent = function_response_event.actions.transfer_to_agent
       if transfer_to_agent:
         agent_to_run = self._get_agent_to_run(
             invocation_context, transfer_to_agent
         )
-        async for item in agent_to_run.run_live(invocation_context):
-          yield item
+        transfer_successful = False
+        try:
+          async for item in agent_to_run.run_live(invocation_context):
+            if not transfer_successful:
+              yield function_response_event
+              transfer_successful = True
+            yield item
+        finally:
+          if not transfer_successful:
+            function_response_event.content.parts[
+                0
+            ].function_response.response = {
+                'result': f'Error transferring to {transfer_to_agent}'
+            }
+            yield function_response_event
+      else:
+        yield function_response_event
 
   async def _postprocess_run_processors_async(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
@@ -478,14 +495,28 @@ class BaseLlmFlow(ABC):
       if auth_event:
         yield auth_event
 
-      yield function_response_event
       transfer_to_agent = function_response_event.actions.transfer_to_agent
       if transfer_to_agent:
         agent_to_run = self._get_agent_to_run(
             invocation_context, transfer_to_agent
         )
-        async for event in agent_to_run.run_async(invocation_context):
-          yield event
+        transfer_successful = False
+        try:
+          async for event in agent_to_run.run_async(invocation_context):
+            if not transfer_successful:
+              yield function_response_event
+              transfer_successful = True
+            yield event
+        finally:
+          if not transfer_successful:
+            function_response_event.content.parts[
+                0
+            ].function_response.response = {
+                'result': f'Error transferring to {transfer_to_agent}'
+            }
+            yield function_response_event
+      else:
+        yield function_response_event
 
   def _get_agent_to_run(
       self, invocation_context: InvocationContext, agent_name: str
@@ -508,6 +539,16 @@ class BaseLlmFlow(ABC):
     ):
       yield response
       return
+
+    llm_request.config = llm_request.config or types.GenerateContentConfig()
+    llm_request.config.labels = llm_request.config.labels or {}
+
+    # Add agent name as a label to the llm_request. This will help with slicing
+    # the billing reports on a per-agent basis.
+    if _ADK_AGENT_NAME_LABEL_KEY not in llm_request.config.labels:
+      llm_request.config.labels[_ADK_AGENT_NAME_LABEL_KEY] = (
+          invocation_context.agent.name
+      )
 
     # Calls the LLM.
     llm = self.__get_llm(invocation_context)
