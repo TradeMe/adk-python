@@ -51,6 +51,10 @@ class UserContent(types.Content):
     ]
     super().__init__(role='user', parts=parts)
 
+  def __eq__(self, other):
+    if isinstance(other, types.Content):
+        return types.Content(role=self.role, parts=self.parts) == other
+
 
 class ModelContent(types.Content):
 

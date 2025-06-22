@@ -463,7 +463,8 @@ async def test_parallel_call_function_resumed():
   )
 
   function_call_to_approve0, function_call_to_approve1 = [
-      part.function_call.args["function_call"] for part in approval_request_event.content.parts
+      part.function_call.args["function_call"]
+      for part in approval_request_event.content.parts
   ]
 
   grant0, grant1 = [
@@ -614,7 +615,10 @@ async def test_sequential_call_function():
   agent = Agent(name="root_agent", model=mock_model, tools=[increase_by_one])
   runner = InMemoryRunner(agent)
   preapproval_events = await runner.run_async(
-      types.Content(role="user", parts=[types.Part.from_text(text="call the function with x as 1")])
+      types.Content(
+          role="user",
+          parts=[types.Part.from_text(text="call the function with x as 1")],
+      )
   )
 
   (
@@ -717,7 +721,9 @@ async def test_sequential_call_function():
   assert runner.session.state["approvals__grants"] == [grant0.model_dump()]
 
   second_preapproval_events = await runner.run_async(
-      types.Content(role="user", parts=[types.Part.from_text(text="call it again with 5")])
+      types.Content(
+          role="user", parts=[types.Part.from_text(text="call it again with 5")]
+      )
   )
   (
       function_call_event1,
@@ -794,6 +800,173 @@ async def test_sequential_call_function():
 
   assert len(summary_event1.content.parts) == 1
   assert summary_event1.content.parts[0].text == "tool was called again"
+
+
+# TODO regression test for past tool calls being called again on second approval
+# TODO validate in the tests that the message history is valid (no duplicate tool calls)
+
+
+async def test_sequential_call_function_parallel_approve():
+  responses = [
+      types.Part.from_function_call(name="increase_by_one", args={"x": 1}),
+      "approval is needed",
+      types.Part.from_function_call(name="increase_by_one", args={"x": 5}),
+      "approval is needed again",
+      "both tools were called",
+  ]
+  mock_model = MockModel.create(responses=responses)
+
+  @tool_policy(
+      actions=[ApprovalAction("mutate_numbers")],
+      resources=lambda args: [f"{TOOL_NAMESPACE}:integers"],
+  )
+  def increase_by_one(x: int) -> int:
+    return x + 1
+
+  agent = Agent(name="root_agent", model=mock_model, tools=[increase_by_one])
+  runner = InMemoryRunner(agent)
+  preapproval_events = await runner.run_async(
+      types.Content(
+          role="user",
+          parts=[types.Part.from_text(text="call the function with x as 1")],
+      )
+  )
+
+  (
+      function_call_event0,
+      approval_request_event0,
+      function_response_event0,
+      model_summary_event0,
+  ) = preapproval_events
+
+  function_call_to_approve0 = approval_request_event0.content.parts[
+      0
+  ].function_call.args["function_call"]
+
+  assert (
+      function_call_event0.content.parts[0].function_call.name
+      == "increase_by_one"
+  )
+  assert (
+      approval_request_event0.content.parts[0].function_call.name
+      == REQUEST_APPROVAL_FUNCTION_CALL_NAME
+  )
+  assert (
+      function_response_event0.content.parts[0].function_response.response[
+          "status"
+      ]
+      == "approval_requested"
+  )
+  assert model_summary_event0.content.parts[0].text == "approval is needed"
+
+  assert (
+      function_call_event0.content.parts[0].function_call.id
+      in runner.session.state["approvals__suspended_function_calls"][0][
+          "function_call"
+      ]["id"]
+  )
+
+  second_preapproval_events = await runner.run_async(
+      types.Content(
+          role="user", parts=[types.Part.from_text(text="call it again with 5")]
+      )
+  )
+  (
+      function_call_event1,
+      approval_request_event1,
+      function_response_event1,
+      model_summary_event1,
+  ) = second_preapproval_events
+
+  function_call_to_approve1 = approval_request_event1.content.parts[
+      0
+  ].function_call.args["function_call"]
+
+  grant_wildcard = ApprovalGrant(
+      effect="allow",
+      actions=[ApprovalAction("mutate_numbers")],
+      resources=[f"{TOOL_NAMESPACE}:integers"],
+      grantee=ApprovalActor(
+          type="tool",
+          id=f"tool:increase_by_one:*",
+          on_behalf_of=ApprovalActor(
+              type="agent",
+              id=runner.session_id,
+              on_behalf_of=ApprovalActor(type="user", id="test_user"),
+          ),
+      ),
+      grantor=ApprovalActor(type="user", id="test_user"),
+  )
+
+  approval_events1 = await runner.run_async(
+      types.Content(
+          role="user",
+          parts=[
+              types.Part.from_function_response(
+                  name=REQUEST_APPROVAL_FUNCTION_CALL_NAME,
+                  response=ApprovalResponse(
+                      grants=[grant_wildcard],
+                  ).model_dump(),
+              )
+          ],
+      )
+  )
+  state_delta_event1, function_response_event1, summary_event1 = (
+      approval_events1
+  )
+  for event in approval_events1:
+    if event.actions and event.actions.state_delta:
+      runner.session.state.update(event.actions.state_delta or {})
+
+  assert runner.session.state["approvals__grants"] == [
+      grant_wildcard.model_dump(),
+  ]
+  assert runner.session.state["approvals__suspended_function_calls"] == [
+      {
+          "function_call": function_call_event0.content.parts[
+              0
+          ].function_call.model_dump(),
+          "sequence": 1,
+          "status": "resumed",
+      },
+      {
+          "function_call": function_call_event1.content.parts[
+              0
+          ].function_call.model_dump(),
+          "sequence": 2,
+          "status": "resumed",
+      },
+  ]
+
+  assert len(function_response_event1.content.parts) == 2
+  assert (
+      function_response_event1.content.parts[0].function_response.id
+      == function_call_to_approve0["id"]
+  )
+  assert (
+      function_response_event1.content.parts[0].function_response.name
+      == "increase_by_one"
+  )
+  assert function_response_event1.content.parts[
+      0
+  ].function_response.response == {"result": 2}
+
+  assert len(function_response_event1.content.parts) == 2
+  assert (
+      function_response_event1.content.parts[1].function_response.id
+      == function_call_to_approve1["id"]
+  )
+  assert (
+      function_response_event1.content.parts[1].function_response.name
+      == "increase_by_one"
+  )
+  assert function_response_event1.content.parts[
+      1
+  ].function_response.response == {"result": 6}
+
+  assert len(summary_event1.content.parts) == 1
+  assert summary_event1.content.parts[0].text == "both tools were called"
+
 
 # TODO regression test for past tool calls being called again on second approval
 # TODO validate in the tests that the message history is valid (no duplicate tool calls)
