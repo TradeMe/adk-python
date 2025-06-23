@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
-import threading
 from typing import AsyncGenerator
 from typing import Generator
 from typing import Optional
@@ -34,6 +33,7 @@ from .agents.llm_agent import LlmAgent
 from .agents.run_config import RunConfig
 from .artifacts.base_artifact_service import BaseArtifactService
 from .artifacts.in_memory_artifact_service import InMemoryArtifactService
+from .auth.credential_service.base_credential_service import BaseCredentialService
 from .code_executors.built_in_code_executor import BuiltInCodeExecutor
 from .events.event import Event
 from .memory.base_memory_service import BaseMemoryService
@@ -73,6 +73,8 @@ class Runner:
   """The session service for the runner."""
   memory_service: Optional[BaseMemoryService] = None
   """The memory service for the runner."""
+  credential_service: Optional[BaseCredentialService] = None
+  """The credential service for the runner."""
 
   def __init__(
       self,
@@ -82,6 +84,7 @@ class Runner:
       artifact_service: Optional[BaseArtifactService] = None,
       session_service: BaseSessionService,
       memory_service: Optional[BaseMemoryService] = None,
+      credential_service: Optional[BaseCredentialService] = None,
   ):
     """Initializes the Runner.
 
@@ -97,6 +100,7 @@ class Runner:
     self.artifact_service = artifact_service
     self.session_service = session_service
     self.memory_service = memory_service
+    self.credential_service = credential_service
 
   def run(
       self,
@@ -333,6 +337,8 @@ class Runner:
     """Finds the agent to run to continue the session.
 
     A qualified agent must be either of:
+    - The agent that returned a function call and the last user message is a
+      function response to this function call.
     - The root agent;
     - An LlmAgent who replied last and is capable to transfer to any other agent
       in the agent hierarchy.
@@ -344,6 +350,15 @@ class Runner:
     Returns:
       The agent of the last message in the session or the root agent.
     """
+    # If the last event is a function response, should send this response to
+    # the agent that returned the corressponding function call regardless the
+    # type of the agent. e.g. a remote a2a agent may surface a credential
+    # request as a special long running function tool call.
+    event = _find_function_call_event_if_last_event_is_function_response(
+        session
+    )
+    if event and event.author:
+      return root_agent.find_agent(event.author)
     for event in filter(lambda e: e.author != 'user', reversed(session.events)):
       if event.author == root_agent.name:
         # Found root agent.
@@ -418,6 +433,7 @@ class Runner:
         artifact_service=self.artifact_service,
         session_service=self.session_service,
         memory_service=self.memory_service,
+        credential_service=self.credential_service,
         invocation_id=invocation_id,
         agent=self.agent,
         session=session,
@@ -522,3 +538,35 @@ class InMemoryRunner(Runner):
         session_service=self._in_memory_session_service,
         memory_service=InMemoryMemoryService(),
     )
+
+
+def _find_function_call_event_if_last_event_is_function_response(
+    session: Session,
+) -> Optional[Event]:
+  events = session.events
+  if not events:
+    return None
+
+  last_event = events[-1]
+  if (
+      last_event.content
+      and last_event.content.parts
+      and any(part.function_response for part in last_event.content.parts)
+  ):
+
+    function_call_id = next(
+        part.function_response.id
+        for part in last_event.content.parts
+        if part.function_response
+    )
+    for i in range(len(events) - 2, -1, -1):
+      event = events[i]
+      # looking for the system long running request euc function call
+      function_calls = event.get_function_calls()
+      if not function_calls:
+        continue
+
+      for function_call in function_calls:
+        if function_call.id == function_call_id:
+          return event
+  return None
