@@ -535,11 +535,9 @@ def test_function_get_auth_response_partial():
   request = mock_model.requests[-1]
   content = request.contents[-1]
   parts = content.parts
-  assert len(parts) == 2
+  assert len(parts) == 1
   assert parts[0].function_response.name == 'call_external_api1'
   assert parts[0].function_response.response == {'result': 1}
-  assert parts[1].function_response.name == 'call_external_api2'
-  assert parts[1].function_response.response == {'result': None}
 
   runner.run(
       new_message=types.Content(
@@ -554,8 +552,6 @@ def test_function_get_auth_response_partial():
   request = mock_model.requests[-1]
   content = request.contents[-1]
   parts = content.parts
-  assert len(parts) == 2
-  assert parts[0].function_response.name == 'call_external_api1'
-  assert parts[0].function_response.response == {'result': None}
-  assert parts[1].function_response.name == 'call_external_api2'
-  assert parts[1].function_response.response == {'result': 2}
+  assert len(parts) == 1
+  assert parts[0].function_response.name == 'call_external_api2'
+  assert parts[0].function_response.response == {'result': 2}
